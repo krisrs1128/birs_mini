@@ -149,7 +149,7 @@ sample_order <- embeddings_df %>%
 
 embeddings_df$SampleIDf <- factor(embeddings_df$SampleID, sample_order)
 
-ggplot(embeddings_df[1:7000,]) +
+ggplot(embeddings_df) +
   geom_hline(yintercept = 0) +
   geom_vline(xintercept = 0) +
   geom_point(
@@ -162,11 +162,6 @@ ggplot(embeddings_df[1:7000,]) +
   guides(col = guide_legend(override.aes = list(alpha = 1, size = 5))) +
   ggtitle("Cell Types") +
   theme(legend.position = "bottom")
-
-ggplot(embeddings_df) +
-  geom_point(aes(x = l1, y = l2, col = prop_19)) +
-  facet_wrap(~ SampleID) +
-  viridis::scale_color_viridis(option = "inferno")
 ```
 
 # Cells $\to$ Samples
