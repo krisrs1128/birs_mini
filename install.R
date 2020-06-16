@@ -1,0 +1,19 @@
+install.packages (c(
+  "caret",
+  "dplyr",
+  "forcats",
+  "rmarkdown",
+  "ggplot2",
+  "glmnet",
+  "igraph",
+  "keras",
+  "raster",
+  "reshape2",
+  "stars",
+  "stringr",
+  "tibble",
+  "tibble",
+  "tidyr",
+  "umap",
+  "viridis"
+))
