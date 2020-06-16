@@ -1,0 +1,403 @@
+---
+title: Disentangling Composition and Spatial Effects
+params:
+  cluster_K: 5
+---
+
+```{r}
+library("ggplot2")
+library("dplyr")
+library("reshape2")
+library("tibble")
+library("igraph")
+library("stringr")
+library("glmnet")
+library("viridis")
+library("forcats")
+source("preprocessing.R")
+theme_set(theme_bw() + theme(panel.grid=element_blank()))
+```
+
+```{r, message = FALSE, warning = FALSE}
+data_dir <- file.path("..", "Data")
+loaded_ <- load_mibi(file.path("..", "Data"))
+subsample <- spatial_subsample(loaded_$tiffs, loaded_$mibi)
+ims <- subsample$ims
+mibi_sce <- subsample$exper
+mibi_sce <- mibi_sce[setdiff(rownames(mibi_sce), "Background"), ]
+```
+
+* get cluster the proteins, and extract compositions from each sample
+* plot this against the tumor intrusion
+* now calculate my own spatial statistics.
+  - neighborhood entropy
+  - neighborhood size
+* relate summaries of these spatial statistics to composition
+  - if not totally predictive, then the latent idea is worthwhile
+  - otherwise, it's a surprise to the community
+
+```{r}
+cell_clusters <- kmeans(t(assay(mibi_sce)), params$cluster_K, iter.max = 50)
+props <- sample_proportions(colData(mibi_sce)$SampleID, cell_clusters$cluster)
+mprops <- data.frame(props)
+```
+
+```{r}
+cd <- colData(mibi_sce) %>%
+  as.data.frame() %>%
+  tidyr::unite(scell, SampleID, cellLabelInImage, remove=FALSE) %>%
+  mutate(
+    cell_group = fct_lump(cell_type, prop = 0.05),
+    SampleID = factor(SampleID, rownames(props))
+  )
+
+cd_samp <- cd %>%
+  group_by(SampleID) %>%
+  summarise_all(function(x) { x[1] }) %>%
+  mutate(SampleID = factor(SampleID, rownames(props)))
+
+cluster_ids <- setNames(cell_clusters$cluster, cd$scell)
+```
+
+These are example sample-level cluster compositions, based entirely on antigen
+information (ignoring spatial information).
+```{r}
+## mprops$cluster <- factor(mprops$cluster, levels = levels(mcenters$cluster))
+ggplot(mprops %>% left_join(cd_samp)) +
+  geom_tile(
+    aes(x = SampleID, y = cluster, fill = sqrt(Freq))
+  ) +
+  facet_grid(. ~ STAGE, scale="free_x", space="free_x") +
+  scale_fill_viridis() +
+  theme(legend.position = "bottom")
+```
+
+
+Extract local entropy and neighborhood sizes.
+```{r spatial_stat, message = FALSE, warning = FALSE}
+sample_names <- as.character(cd_samp$SampleID)
+graphs <- extract_graphs(ims, sample_names)
+spatial <- spatial_wrapper(sample_names, graphs, cluster_ids)
+```
+
+```{r plot_spatial}
+spatial <- spatial %>%
+  mutate(
+    SampleID = str_match(scell, "[0-9]+"),
+    SampleID = factor(SampleID, levels(mprops$SampleID))
+  )
+
+spatial_samp <- spatial %>%
+  inner_join(cd) %>%
+  group_by(SampleID) %>%
+  summarise(
+    me = mean(entropy),
+    sde = sd(entropy),
+    mdist = mean(avg_dists),
+    sdist = sd(avg_dists),
+    .groups = "drop"
+  ) %>%
+  left_join(cd_samp)
+
+spatial_cell <- spatial %>%
+  tidyr::separate(scell, c("SampleID", "cellLabelInImage")) %>%
+  mutate(cellLabelInImage = as.numeric(cellLabelInImage)) %>%
+  left_join(cd)
+```
+
+```{r}
+## overall histograms
+ggplot(spatial_cell) +
+  geom_histogram(aes(x = entropy, fill = as.factor(TIL_score))) +
+  scale_fill_brewer(palette = "Greens", na.value = "grey") +
+  facet_grid(cell_group ~ ., scale = "free") +
+  theme(
+    legend.position = "bottom",
+    strip.text.y = element_text(angle = 0)
+  )
+
+ggplot(spatial_cell) +
+  geom_histogram(aes(x = avg_dists, fill = as.factor(TIL_score))) +
+  scale_fill_brewer(palette = "Greens", na.value = "grey") +
+  facet_grid(cell_group ~ ., scale = "free") +
+  theme(
+    legend.position = "bottom",
+    strip.text.y = element_text(angle = 0)
+  )
+
+slev <- spatial_samp %>%
+  dplyr::select(SampleID, mdist) %>%
+  arrange(mdist) %>%
+  .[["SampleID"]]
+
+ggplot(spatial_cell %>%
+       mutate(SampleID = factor(SampleID, levels = slev))
+       ) +
+  geom_point(
+    aes(x = avg_dists, y = entropy, col = cell_group),
+    size = 0.5, alpha = 0.8
+  ) +
+  facet_wrap(~ SampleID) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(
+    legend.position = "bottom",
+    strip.text.y = element_text(angle = 0),
+    panel.spacing = unit(0, "cm")
+  )
+```
+
+This is how each individual differs in terms of the cell-label entropy of and
+average pairwise distance of their 5-nearest neighborhoods.
+
+```{r}
+## Sample level plots
+ggplot(spatial_samp) +
+  geom_point(
+    aes(x = me, y = Survival_days_capped_2016.1.1),
+    size = 4
+  ) +
+  geom_point(
+    aes(x = me, y = Survival_days_capped_2016.1.1, col = as.factor(TIL_score)),
+    size = 2
+  ) +
+  scale_color_brewer(palette = "Greens", na.value = "grey") +
+  theme(legend.position = "bottom")
+
+ggplot(spatial_samp) +
+  geom_point(
+    aes(x = mdist, y = Survival_days_capped_2016.1.1),
+    size = 4
+  ) +
+  geom_point(
+    aes(x = mdist, y = Survival_days_capped_2016.1.1, col = as.factor(TIL_score)),
+    size = 2
+  ) +
+  scale_color_brewer(palette = "Greens", na.value = "grey") +
+  theme(legend.position = "bottom")
+
+## Cell level plots
+ggplot(spatial_cell) +
+  geom_jitter(
+    aes(x = TIL_score, y = entropy, col = as.factor(SampleID)),
+    size = 0.8, alpha = 0.8
+  ) +
+  theme(legend.position = "none")
+
+ggplot(spatial_cell) +
+  geom_jitter(
+    aes(x = TIL_score, y = avg_dists, col = as.factor(SampleID)),
+    size = 0.8, alpha = 0.8
+  ) +
+  theme(legend.position = "none")
+```
+
+* Can we predict properties of the sample-wise entropy distribution based on
+  just the cell compositions?
+* Is there something about the survival that isn't captured entirely by the
+  composition information?
+
+```{r}
+spatial_samp <- spatial_samp %>%
+  mutate(SampleID = factor(SampleID, levels(mprops$SampleID)))
+
+spatial_comp <- spatial_samp %>%
+  dplyr::select(SampleID, me, sde, mdist, sdist, TIL_score) %>%
+  left_join(mprops) %>%
+  dcast(SampleID + me + sde + mdist + sdist + TIL_score ~ cluster)
+
+x <- spatial_comp %>%
+  dplyr::select(matches("[0-9]+")) %>%
+  as.matrix() %>%
+  sqrt()
+```
+
+```{r}
+y <- as.numeric(scale(spatial_comp$me))
+fits <- fit_wrapper(x, y)
+plot_fits(x, y, fits$glmnet, fits$rf)
+```
+
+It looks like quite a bit, but not all, of the variation in average entropy, can
+be explained by cell composition. What about the average neighborhood size or
+standard errors of entropy and neighborhood size?
+
+```{r}
+y <- as.numeric(scale(spatial_comp$mdist))
+fits <- fit_wrapper(x, y)
+plot_fits(x, y, fits$glmnet, fits$rf)
+
+y <- as.numeric(scale(spatial_comp$sde))
+fits <- fit_wrapper(x, y)
+plot_fits(x, y, fits$glmnet, fits$rf)
+
+y <- as.numeric(scale(spatial_comp$sdist))
+fits <- fit_wrapper(x, y)
+plot_fits(x, y, fits$glmnet, fits$rf)
+```
+
+It seems like average pairwise distance is predictable, though not quite as much
+as entropy. The standard errors are not predictable using the linear model, but
+seem okay using the random forest (which I find an odd result...)
+
+What about the TIL score?
+
+```{r}
+y <- as.numeric(scale(spatial_comp$TIL_score))
+keep_ix <- !is.na(y)
+sum(keep_ix)
+
+fits <- fit_wrapper(x[keep_ix, ], y[keep_ix])
+plot_fits(x[keep_ix, ], y[keep_ix], fits$glmnet, fits$rf)
+```
+
+There are so many missing values in TIL score, that I'm not sure whether we're
+actually learning anything meaningful here. It may be the case that the entropy
+and neighborhood size features are predictable, but not the TIL score? I don't
+have an explanation for how that could happen, though.
+
+# Interpreting Models
+
+```{r}
+y <- as.numeric(scale(spatial_comp$me))
+fits <- fit_wrapper(x, y)
+preds <- plot_fits(x[keep_ix, ], y[keep_ix], fits$glmnet, fits$rf)
+preds$TIL_score <- spatial_samp$TIL_score[keep_ix]
+ggplot(preds) +
+  geom_abline(slope = 1) +
+  geom_point(
+    aes(x = y, y = y_hat, col = TIL_score)
+  ) +
+  scale_color_viridis()
+```
+
+First, let's study the output of the glmnet model, even though it's performance is lower.
+
+```{r}
+beta_hat <- varImp(fits$rf)$importance$Overall
+imp_ix <- order(beta_hat, decreasing = TRUE)
+
+mx <- data.frame(x = x[, imp_ix[1:9]], y = y, TIL_score = spatial_samp$TIL_score) %>%
+  melt(id.vars = c("y", "TIL_score"))
+
+ggplot(mx) +
+  geom_point(aes(x = value, y = y, col = TIL_score)) +
+  scale_color_viridis() +
+  facet_wrap(~ variable, ncol = 3)
+
+y_order <- order(y)
+image(t(cbind(y[y_order] / 4, x[y_order, imp_ix[1:10] - 1])))
+```
+
+How can we interpret the associated clusters?
+
+```{r}
+z <- cell_clusters$centers
+mcenters <- melt(z, varnames = c("cluster", "protein")) %>%
+  mutate(
+    protein = factor(protein, colnames(z)[hclust(dist(t(z), method="manhattan"))$order]),
+    cluster = factor(cluster, hclust(dist(z, method = "manhattan"))$order),
+    )
+
+mcenters <- mcenters %>%
+  left_join(data.frame(
+      cluster = factor(1:20, levels = levels(mcenters$cluster)),
+      beta = beta_hat
+  ))
+
+ggplot(mcenters) +
+  geom_bar(
+    aes(x = protein, y = value),
+    stat = "identity"
+  ) +
+  scale_y_continuous(limits = c(-2, 6), oob = scales::squish) +
+  facet_wrap(~ cluster) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0))
+
+ggplot(mcenters) +
+  geom_bar(
+    aes(x = protein, y = value, fill = beta),
+    stat = "identity"
+  ) +
+  scale_fill_viridis() +
+  scale_y_continuous(limits = c(-2, 6), oob = scales::squish) +
+  facet_wrap(~ cluster) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0))
+
+ggplot(mcenters %>% filter(abs(beta) > 30)) +
+  geom_bar(
+    aes(x = protein, y = value, fill = beta),
+    stat = "identity"
+  ) +
+  scale_fill_viridis() +
+  scale_y_continuous(limits = c(-2, 6), oob = scales::squish) +
+  facet_grid(cluster ~ .) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0))
+```
+
+We can make something similar for the random forest model.
+
+# Regressing proxy response
+
+An easy way to tell whether there is additional structure from one source
+relative to another is to see whether the ability to predict some independently
+interesting variable changes when you include that source. This is the
+table-wise analog of variable importance. In principle, we could multitask
+regress on to several phenotypic variables, but for now, we'll focus on
+survival.
+
+There seem to be two general ways to approach this,
+* Predict using the two tables separately, then together. See to what extent the
+  underlying information is orthogonal. If the information is completely
+  redundant, there is no benefit by combining the separate sources.
+* Compute the residual of one source, regressing out the other. This is somehow
+  the "leftover" structure, and can also be used for prediction.
+
+We'll try both approaches here. First, predicting separately, then together.
+
+```{r}
+combined_x <- spatial_comp %>%
+  dplyr::select(-SampleID, -TIL_score) %>%
+  mutate_at(vars(matches("[0-9]+")), sqrt) %>%
+  as.matrix()
+
+library("survival")
+library("glmnet")
+library("randomForestSRC")
+keep_ix <- !is.na(spatial_samp$Survival_days_capped_2016.1.1)
+y <- Surv(spatial_samp$Survival_days_capped_2016.1.1[keep_ix], spatial_samp$Censored[keep_ix])
+
+surv_glmnet <- cv.glmnet(scale(combined_x[keep_ix, ]), y, family = "cox")
+plot(surv_glmnet)
+plot(surv_glmnet$glmnet.fit)
+
+surv_rf <- rfsrc(y ~ . , data = data.frame(combined_x[keep_ix, ], y = y), mtry=20)
+plot(surv_rf) # this model is hopeless
+```
+
+So, it doesn't seem like survival is so easy to predict, using this information.
+So, let's reorient, and try to predict relevant groups of phenotypic
+information. To do this, we'll convert the phenotypic metadata into something we
+can do dimensionality reduction on. But first, is there any correlation between
+the x matrix we've constructed and the characteristics of the people?
+predict the donor number (not really surprising). Other than that, the only
+variable I'm really able to predict is TIL score, which makes sense.
+
+```{r}
+y <- spatial_comp$TIL_score
+x1 <- spatial_comp[, c("me", "sde", "mdist", "sdist")] %>%
+  as.matrix()
+keep_ix <- !is.na(y)
+train(x1[keep_ix, ], y[keep_ix])
+
+x2 <- spatial_comp %>%
+  dplyr::select(matches("[0-9]+")) %>%
+  as.matrix() %>%
+  sqrt()
+train(x2[keep_ix, ], y[keep_ix])
+train(cbind(x1[keep_ix, ], x2[keep_ix, ]), y[keep_ix])
+```
+
+
+# Predicting Tables of Features
+
+Can we say anything more about interpretation as well?

@@ -1,0 +1,329 @@
+---
+title: Mapping between Embeddings
+params:
+  qsize: 1000 # size of image quadrant we subset to
+  cluster_K: 15 # number of clusters in the umap layout space
+---
+
+_Goal_: Map mass-spec measurements to plausible spatial expression patterns, based
+on MIBI-  scale_y_continuous(limits = c(-15, 5)) +
+  scale_x_continuous(limits = c(-15, 17)) +
+ToF measurements, and provide some sense of uncertainty in the estimate.
+
+_Outline_:
+
+* For MIBI data, derive cell-level embeddings, based both on the cells' protein
+  expression levels and local spatial ecosystem.
+    - This is the part of the analysis that is the most open-ended -- there are
+    many ways to build embeddings from either quantitative matrices or images /
+    graphs, and we also have to decide how to combine them.
+    - We'll start with something simple: U-Map on quantitative and derived
+    spatial features, with a parameter trading off the relative weights of the
+    two tables.
+    - Would be very interesting to try image (autoencoder) or graph (graph nn)
+    features.
+* Summarize MIBI samples based on these cell-level features. The idea is to
+  cluster the embeddings and summarize a sample based on the fraction of cells
+  that belong to each cluster.
+* Relate mass-spec and MIBI measurements by learning a mapping from common
+  features (9 shared proteins and overlapping patient characteristics) to the
+  location on the embedding.
+  - Our predicted spatial expression for a cytof sample is the spatial
+    expression pattern associated with that region in the predicted embedding
+    space.
+  - We can gauge our ability to actually perform spatial expression imputation
+    by (1) our prediction ability, from test mibitof samples to their true
+    embeddings, and (2) a proportion-of-variance like quantity on the
+    original embeddings[^1].
+
+_Themes_:
+
+* Try assembling easily re-usable components, and understanding their behavior
+  when combined. This seems more broadly useful than trying to come up with a
+  single model that cannot be reused elsewhere.
+* The notion of a "sampling unit" is hierarchical (at least, it's not clear
+  cut). We need to think of sampling and variation at both the patient and
+  cellular level.
+* The dichotomy between ML and stats is artificial, especially in applications
+  like this, which are heavy in both non-tabular data and scientific questions.
+  Liberally use methods from both disciplines.
+
+```{r}
+library("dplyr")
+library("forcats")
+library("ggplot2")
+library("igraph")
+library("keras")
+library("raster")
+library("reshape2")
+library("stars")
+library("stringr")
+library("tibble")
+library("tidyr")
+library("umap")
+library("viridis")
+source("preprocessing.R")
+theme_set(theme_bw() + theme(panel.grid=element_blank()))
+```
+
+Our setup (building graphs and sample summaries) is similar to the
+`composition.Rmd` document.
+
+```{r, message = FALSE, warning = FALSE}
+data_dir <- file.path("..", "Data")
+load(file.path(data_dir, "masstagSCE.rda"))
+masstag <- data_list("sce")
+masstag$mibi.sce_proteins <- NULL
+masstag$mibi_sce <- NULL
+
+loaded_ <- load_mibi(file.path("..", "Data"))
+subsample <- spatial_subsample(loaded_$tiffs, loaded_$mibi)
+ims <- subsample$ims
+mibi_sce <- subsample$exper
+mibi_sce <- mibi_sce[setdiff(rownames(mibi_sce), "Background"), ]
+```
+
+```{r}
+shared_proteins <- intersect(unlist(sapply(masstag, names)), rownames(mibi_sce))
+rm(masstag)
+rm(epith.sce)
+rm(livecells.sce)
+rm(myeloid.sce)
+rm(cd45.sce)
+rm(tcell.sce)
+```
+
+```{r}
+cd <- colData(mibi_sce) %>%
+  as.data.frame() %>%
+  tidyr::unite(scell, SampleID, cellLabelInImage, remove=FALSE) %>%
+  mutate(cell_group = fct_lump(cell_type, prop = 0.05))
+
+cd_samp <- cd %>%
+  group_by(SampleID) %>%
+  summarise_all(function(x) { x[1] })
+```
+
+```{r}
+sample_names <- as.character(cd_samp$SampleID)
+graphs <- extract_graphs(ims, sample_names)
+
+cell_clusters <- kmeans(t(assay(mibi_sce)), params$cluster_K, iter.max = 50)
+cluster_ids <- setNames(cell_clusters$cluster, cd$scell)
+heatmap(table(cell_clusters$cluster, cd$cell_type))
+spatial <- spatial_wrapper(sample_names, graphs, cluster_ids)
+```
+
+Now, we'll transform the neighborhood proportion features and learn some
+embeddings.
+
+```{r}
+x <- spatial %>%
+  dplyr::select(starts_with("prop")) %>%
+  as.matrix()
+
+# learning embeddings across the two tables
+conf <- umap.defaults
+conf$min_dist <- 0.9
+conf$n_neighbors <- 75
+embeddings <- umap(x, conf)
+embeddings_df <- embeddings$layout %>%
+  as_tibble(.name_repair = "universal") %>%
+  ## rename("l1" = "...1", "l2" = "...2") %>%
+  rename(`...1` = "l1", `...2` = "l2") %>%
+  mutate(scell = spatial$scell) %>%
+  left_join(cd) %>%
+  left_join(spatial) %>%
+  mutate(SampleID = as.numeric(str_match(scell, "[0-9]+")))
+```
+
+We'll plot the embeddings we just made, against some of the derived features.
+
+```{r, fig.height = 8, fig.width = 6}
+sample_order <- embeddings_df %>%
+  group_by(SampleID) %>%
+  summarise(me = mean(entropy)) %>%
+  arrange(me) %>%
+  .[["SampleID"]] %>%
+  as.character()
+
+embeddings_df$SampleIDf <- factor(embeddings_df$SampleID, sample_order)
+
+ggplot(embeddings_df[1:7000,]) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  geom_point(
+    aes(x = l1, y = l2, col = cell_group),
+    size = 0.5, alpha = 0.2
+  ) +
+  facet_wrap(~SampleIDf) +
+  coord_fixed() +
+  scale_color_brewer(palette = "Set2", na.value = "grey") +
+  guides(col = guide_legend(override.aes = list(alpha = 1, size = 5))) +
+  ggtitle("Cell Types") +
+  theme(legend.position = "bottom")
+
+ggplot(embeddings_df) +
+  geom_point(aes(x = l1, y = l2, col = prop_19)) +
+  facet_wrap(~ SampleID) +
+  viridis::scale_color_viridis(option = "inferno")
+```
+
+# Cells $\to$ Samples
+
+Now that we have embeddings at the cell level, we can try to summarize samples
+by how many of their cells lie in different regions of the embedding space.
+First, we'll cluster using an arbitrary $K$.
+
+```{r}
+clusters <- kmeans(embeddings$layout, centers = params$cluster_K)
+
+# plot the clusters
+ggplot(embeddings_df) +
+  geom_point(
+    aes(x = l1, y = l2, col = cell_group),
+    size = 0.5, alpha = 0.1
+  ) +
+  geom_text(
+    data = data.frame(clusters$centers, cluster = seq_len(nrow(clusters$centers))),
+    aes(x = X1, y = X2, label = cluster), size = 5
+  ) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  guides(col = guide_legend(override.aes = list(alpha = 1, size = 5))) +
+  facet_wrap(~SampleID) +
+  ggtitle("Clusters vs. Cell Types") +
+  theme(legend.position = "bottom")
+
+# summarize the samples
+embeddings_df$cluster <- as_factor(clusters$cluster)
+cluster_props <- embeddings_df %>%
+  group_by(SampleID, cluster) %>%
+  summarise(count = n()) %>%
+  group_by(SampleID) %>%
+  mutate(
+    total = sum(count),
+    prop = count / total
+  )
+
+ggplot(cluster_props) +
+  geom_bar(
+    aes(x = as.factor(SampleID), y = prop, fill = cluster),
+    position = "stack", stat = "identity"
+  ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0, 0))
+```
+
+# Guessing the Embedding
+
+We'll finally load the cytof data to identify shared features. Then, we'll look
+at the relationship between those features and the above embeddings, to see if
+we could map the cytof data into the mibitof embedding space.
+
+I'll learn a mapping at the cell level, using (1) cell identity and (2) levels
+of `r shared_proteins` to identify the corresponding location in the embedding
+space. If this is accurate, we could then cluster the imputed cell embeddings,
+to come up with a new spatial summary of the mass spec data. Otherwise, we would
+report that the protein information on its own is not enough to determine the
+spatial characteristics of the sample.
+
+This prepares the training data, which maps protein values and cell type
+indicators to embedding locations.
+
+```{r}
+pred_mat <- assay(mibi_sce) %>%
+  t() %>%
+  data.frame()
+pred_mat$scell <- cd$scell
+pred_mat <- embeddings_df %>%
+  dplyr::select(scell) %>%
+  left_join(pred_mat) %>%
+  dplyr::select(-scell) %>%
+  as.matrix()
+
+response <- embeddings_df %>%
+  dplyr::select(l1, l2) %>%
+  as.matrix()
+
+keep_ix <- !is.na(pred_mat[, 1])
+model <- generate_model(ncol(pred_mat[, shared_proteins]))
+model %>%
+  fit(pred_mat[keep_ix, shared_proteins], response[keep_ix, ], epochs=250, batch_size=1024)
+```
+
+```{r}
+y_hat <- predict(model, pred_mat[keep_ix, shared_proteins])
+y_hat_df <- cbind(y_hat = y_hat, y = response[keep_ix, ]) %>%
+  as.data.frame()
+y_hat_df <- cbind(y_hat_df, cell_group = embeddings_df$cell_group[keep_ix])
+
+y_hat_df <- rbind(
+  cbind(y_hat_df[, c("V1", "l1", "cell_group")], axis = 1),
+  cbind(y_hat_df[, c("V2", "l2", "cell_group")], axis = 2) %>%
+  setNames(c("V1", "l1", "cell_group", "axis"))
+)
+colnames(y_hat_df)[1:2] <- c("predicted", "truth")
+
+ggplot(y_hat_df) +
+  geom_abline(slope = 1) +
+  geom_point(
+    aes(x = truth, y = predicted, col = cell_group),
+    size = 0.2, alpha = 0.6
+  ) +
+  facet_grid(. ~ axis) +
+  scale_color_brewer(palette = "Set2", na.value = "grey") +
+  guides(col = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  coord_fixed() +
+  theme(legend.position = "bottom")
+```
+
+What happens when we summarize these samples by these predicted cluster
+memberships? Ideally, you would be able to recognize the original cluster
+compositions, which should reflect spatial expression patterns (if they don't
+already).
+
+In the worst case, the imputed cluster compositions would be totally unrelated
+to the real (known, for the MIBI-ToF data) compositions.
+
+We can compare this with what the predictions would have been if we had used all
+the proteins (but no explicit spatial information).
+
+```{r}
+pred_mat <- pred_mat[, -which(colnames(pred_mat) == "Background")]
+model <- generate_model(ncol(pred_mat))
+model %>%
+  fit(pred_mat[keep_ix, ], response[keep_ix, ], epochs=250, batch_size=1024)
+```
+
+```{r}
+y_hat <- predict(model, pred_mat[keep_ix, ])
+y_hat_df <- cbind(y_hat = y_hat, y = response[keep_ix, ]) %>%
+  as.data.frame()
+y_hat_df <- cbind(y_hat_df, cell_group = embeddings_df$cell_group[keep_ix])
+
+y_hat_df <- rbind(
+  cbind(y_hat_df[, c("V1", "l1", "cell_group")], axis = 1),
+  cbind(y_hat_df[, c("V2", "l2", "cell_group")], axis = 2) %>%
+  setNames(c("V1", "l1", "cell_group", "axis"))
+)
+colnames(y_hat_df)[1:2] <- c("predicted", "truth")
+
+ggplot(y_hat_df) +
+  geom_abline(slope = 1) +
+  geom_point(
+    aes(x = truth, y = predicted, col = cell_group),
+    size = 0.2, alpha = 0.6
+  ) +
+  facet_grid(. ~ axis) +
+  scale_color_brewer(palette = "Set2", na.value = "grey") +
+  guides(col = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  coord_fixed() +
+  theme(legend.position = "bottom")
+```
+
+What do these (cell-level) predictions look like when we use the mass spec data?
+
+[^1]: We can try predicting different sample characteristics from the
+    embeddings, for example. It seems like what people do by eye anyways (trying
+    to tell whether known group separate).
